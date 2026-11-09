@@ -1,0 +1,288 @@
+#!/bin/zsh
+# glasspanic — triage for the macOS 27.2 "Liquid Glass" render bug.
+# Read-only by default. No sudo. No telemetry. No file deletion.
+# This tool is NOT an Apple fix. It maps symptoms to known workarounds and
+# can store one accessibility preference, then reads it back to prove the write.
+emulate -L zsh
+set -u
+setopt pipefail 2>/dev/null || true
+
+VERSION="0.1.0"
+EXIT_OK=0
+EXIT_USAGE=2
+EXIT_VERIFY=3
+
+MODE="doctor"
+JSON=0
+PRINT_ONLY=0
+ASSUME_YES=0
+
+usage() {
+  cat <<'USAGE'
+glasspanic — macOS 27.2 Liquid Glass render-bug triage (read-only by default)
+
+Usage:
+  glasspanic                 Symptom map + current view settings
+  glasspanic --json          Same data as machine-readable JSON
+  glasspanic --apply         Store Reduce Transparency = on, then verify read-back
+  glasspanic --revert        Store Reduce Transparency = off, then verify read-back
+  glasspanic --nudge         Restart SystemUIServer / MenuBarAgent (asks first)
+  glasspanic --print         Show the commands a mode would run, change nothing
+
+Options:
+  --yes        Allow --nudge without an interactive prompt (needed in scripts)
+  --version    Print version
+  --help       This text
+
+Exit codes: 0 ok | 2 usage error | 3 preference write could not be verified
+
+Safety: no sudo, no deletion, no third-party app is quit, nothing is uploaded.
+USAGE
+}
+
+os_darwin() { [[ "$(uname -s)" == "Darwin" ]] }
+
+# Fills PREF_STATE / PREF_VALUE. Never guesses: unreadable stays "unset".
+read_pref() {
+  local dom="$1" key="$2" out
+  PREF_STATE="unset"
+  PREF_VALUE=""
+  if ! os_darwin; then PREF_STATE="unsupported"; return; fi
+  if out=$(defaults read "$dom" "$key" 2>/dev/null); then
+    PREF_STATE="present"
+    PREF_VALUE="${out//$'\n'/ }"
+  fi
+}
+
+# 1 / 0 / raw
+norm_bool() {
+  local v="${1:l}"
+  case "$v" in
+    1|true|yes) print -r -- "1" ;;
+    0|false|no) print -r -- "0" ;;
+    *)          print -r -- "$1" ;;
+  esac
+}
+
+jstr() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  print -rn -- "$s"
+}
+
+# ---- symptom map (targeted at 27.2, build 26B1xx) -------------------------
+SYM_IDS=(blank_dialog menus_vanish menubar_clicks third_party_panel)
+SYM_TITLES=(
+  "Blank / grey dialogs"
+  "Menus invisible after app switch"
+  "Menu bar clicks do nothing"
+  "Third-party status panels do not open"
+)
+SYM_SIGNALS=(
+  "Save or close dialogs render empty grey and ignore clicks; text appears only after a screenshot."
+  "Switching apps leaves the menu bar drawn but empty; menus exist, they are just not composited."
+  "Clicks on the menu bar never reach MenuBarAgent (reported twice on build 26B123)."
+  "Dashboard-style panels (e.g. surge-style menus) fail to open; vendor fix deferred to 27.3/27.2.1."
+)
+SYM_FIRST_STEPS=(
+  "Press Cmd+R to redraw, or resize the window, then retry the dialog. If it stays blank, save via keyboard (Cmd+S) instead of the button."
+  "Move the pointer to the very top edge, then press Cmd+Tab once and back. A --nudge refresh usually restores drawing."
+  "Refresh the UI agents with --nudge. Do not reboot first; the loop is a compositing refresh, not a boot problem."
+  "Treat it as the same render-layer bug; no local fix exists. Track the vendor bug and wait for 27.3."
+)
+SYM_EVIDENCE=(
+  "https://discussions.apple.com/thread/256389850"
+  "https://forums.macrumors.com/threads/solution-to-disappearing-menus-in-macos-27-2.2493017/"
+  "https://github.com/jizhi0v0/macos27-beta-issues (issue #35, FB25347429)"
+  "https://kb.nssurge.com/surge-knowledge-base/faq/mac-dashboard-crash (FB25184160)"
+)
+
+# ---- preference probes ----------------------------------------------------
+PREF_DOMS=(com.apple.universalaccess com.apple.universalaccess com.apple.Accessibility com.apple.Accessibility com.apple.Accessibility com.apple.Accessibility)
+PREF_KEYS=(reduceTransparency reduceMotion ReduceTransparencyEnabled ReduceMotionEnabled IncreaseContrast EnhancedBackgroundContrastEnabled)
+PREF_LABELS=(
+  "Reduce Transparency"
+  "Reduce Motion"
+  "Reduce Transparency (alt key)"
+  "Reduce Motion (alt key)"
+  "Increase Contrast"
+  "Enhanced Background Contrast"
+)
+
+collect() {
+  local i
+  PREF_STATES=() PREF_VALUES=()
+  for (( i = 1; i <= ${#PREF_KEYS}; i++ )); do
+    read_pref "$PREF_DOMS[$i]" "$PREF_KEYS[$i]"
+    PREF_STATES+=("$PREF_STATE")
+    PREF_VALUES+=("$PREF_VALUE")
+  done
+  OS_NAME="$(uname -s)"
+  OS_VER="unknown" OS_BUILD="unknown"
+  if os_darwin; then
+    OS_VER=$(sw_vers -productVersion 2>/dev/null || print unknown)
+    OS_BUILD=$(sw_vers -buildVersion 2>/dev/null || print unknown)
+  fi
+}
+
+# ---- actions --------------------------------------------------------------
+set_reduce_transparency() {
+  local want="$1" expected="$2" readback got
+  if ! os_darwin; then
+    print -u2 -- "glasspanic: preference writes are macOS-only; this host is $OS_NAME."
+    return "$EXIT_USAGE"
+  fi
+  local cmd=(defaults write com.apple.universalaccess reduceTransparency -bool "$want")
+  if (( PRINT_ONLY )); then
+    print -r -- "would run: ${(j: :)cmd}"
+    print -r -- "then verify: defaults read com.apple.universalaccess reduceTransparency"
+    return "$EXIT_OK"
+  fi
+  "${cmd[@]}" || { print -u2 -- "glasspanic: write failed."; return "$EXIT_VERIFY"; }
+  read_pref com.apple.universalaccess reduceTransparency
+  if [[ "$PREF_STATE" != "present" ]]; then
+    print -u2 -- "glasspanic: wrote the key but could not read it back. Not claiming success."
+    return "$EXIT_VERIFY"
+  fi
+  got=$(norm_bool "$PREF_VALUE")
+  if [[ "$got" != "$expected" ]]; then
+    print -u2 -- "glasspanic: read-back mismatch (wanted $expected, got '$PREF_VALUE'). Not claiming success."
+    return "$EXIT_VERIFY"
+  fi
+  print -r -- "Stored: Reduce Transparency = $PREF_VALUE (read-back verified)"
+  print -r -- "Scope: this proves the preference is stored. It does NOT prove the running UI applied it."
+  if (( expected == 1 )); then
+    print -r -- "Revert with: glasspanic --revert   (or: defaults write com.apple.universalaccess reduceTransparency -bool false)"
+    print -r -- "If dialogs stay blank, refresh drawing with: glasspanic --nudge --yes"
+  else
+    print -r -- "Reduce Transparency is stored as off. Windows may regain transparency on next app launch."
+  fi
+  return "$EXIT_OK"
+}
+
+nudge() {
+  local agents=(SystemUIServer MenuBarAgent) running=() a
+  if ! os_darwin; then
+    print -u2 -- "glasspanic: --nudge needs macOS UI agents; this host is $OS_NAME."
+    return "$EXIT_USAGE"
+  fi
+  for a in $agents; do
+    pgrep -x "$a" >/dev/null 2>&1 && running+=("$a")
+  done
+  if (( ${#running} == 0 )); then
+    print -r -- "No SystemUIServer / MenuBarAgent process found. Nothing to refresh; no action taken."
+    return "$EXIT_OK"
+  fi
+  print -r -- "Will restart (short UI flash, no data loss): ${(j:, :)running}"
+  if (( PRINT_ONLY )); then
+    for a in $running; do print -r -- "would run: killall $a"; done
+    return "$EXIT_OK"
+  fi
+  if (( ! ASSUME_YES )); then
+    if [[ ! -t 0 ]]; then
+      print -u2 -- "glasspanic: refusing to restart UI agents without a prompt. Re-run with --yes."
+      return "$EXIT_USAGE"
+    fi
+    printf 'Continue? [y/N] '
+    local reply=""
+    read -r reply
+    [[ "${reply:l}" == "y" ]] || { print -r -- "Cancelled. Nothing changed."; return "$EXIT_OK"; }
+  fi
+  for a in $running; do
+    killall "$a" >/dev/null 2>&1 && print -r -- "restarted: $a" || print -r -- "could not restart: $a"
+  done
+  print -r -- "This only forces a redraw. It is not a fix for the 27.2 render bug."
+  return "$EXIT_OK"
+}
+
+# ---- output ---------------------------------------------------------------
+render_text() {
+  local i
+  print -r -- "glasspanic $VERSION — Liquid Glass render-bug triage"
+  print -r -- "Mode: read-only (no change unless --apply / --revert / --nudge)"
+  print -r -- ""
+  print -r -- "SYSTEM"
+  print -r -- "  platform        $OS_NAME $OS_VER (build $OS_BUILD)"
+  print -r -- "  symptom map for macOS 27.2 (build 26B1xx)"
+  if [[ "$OS_VER" == 27.2* ]]; then
+    print -r -- "  version match   yes — this machine is on 27.2"
+  elif [[ "$OS_VER" == "unknown" || "$OS_NAME" != "Darwin" ]]; then
+    print -r -- "  version match   not measurable on this host"
+  else
+    print -r -- "  version match   no — this machine is not on 27.2; the symptoms below may not reproduce here"
+  fi
+  print -r -- ""
+  print -r -- "VIEW SETTINGS (read from preferences)"
+  local shown
+  for (( i = 1; i <= ${#PREF_KEYS}; i++ )); do
+    case "$PREF_STATES[$i]" in
+      present)     shown="$PREF_VALUES[$i]" ;;
+      unset)       shown="unset (system default, key never written)" ;;
+      unsupported) shown="not measured (not macOS)" ;;
+      *)           shown="not measured" ;;
+    esac
+    printf "  %-34s %s\n" "$PREF_LABELS[$i]" "$shown"
+  done
+  print -r -- "  Stored values are not proof the live UI applied them."
+  print -r -- ""
+  print -r -- "SYMPTOM MAP"
+  for (( i = 1; i <= ${#SYM_IDS}; i++ )); do
+    print -r -- "  [$i] $SYM_TITLES[$i]   ($SYM_IDS[$i])"
+    print -r -- "      looks like : $SYM_SIGNALS[$i]"
+    print -r -- "      try first  : $SYM_FIRST_STEPS[$i]"
+    print -r -- "      evidence   : $SYM_EVIDENCE[$i]"
+  done
+  print -r -- ""
+  print -r -- "LIMITS"
+  print -r -- "  - Not an Apple patch. Workarounds expire when 27.3 ships (beta 1 was 2026-11-04)."
+  print -r -- "  - No sudo, no file deletion, no third-party app is quit, no network calls."
+  print -r -- "  - Unreadable setting is reported as unset/not measured, never guessed."
+}
+
+render_json() {
+  local i sep
+  print -rn -- "{\"tool\":\"glasspanic\",\"version\":\"$(jstr "$VERSION")\","
+  print -rn -- "\"read_only\":true,\"sudo_used\":false,\"network_used\":false,"
+  print -rn -- "\"system\":{\"platform\":\"$(jstr "$OS_NAME")\",\"version\":\"$(jstr "$OS_VER")\",\"build\":\"$(jstr "$OS_BUILD")\",\"symptom_map_target\":\"macOS 27.2 (26B1xx)\"},"
+  print -rn -- "\"view_settings\":["
+  for (( i = 1; i <= ${#PREF_KEYS}; i++ )); do
+    (( i > 1 )) && print -rn -- ","
+    print -rn -- "{\"label\":\"$(jstr "$PREF_LABELS[$i]")\",\"domain\":\"$(jstr "$PREF_DOMS[$i]")\",\"key\":\"$(jstr "$PREF_KEYS[$i]")\",\"state\":\"$(jstr "$PREF_STATES[$i]")\",\"value\":\"$(jstr "$PREF_VALUES[$i]")\"}"
+  done
+  print -rn -- "],\"symptoms\":["
+  for (( i = 1; i <= ${#SYM_IDS}; i++ )); do
+    (( i > 1 )) && print -rn -- ","
+    print -rn -- "{\"id\":\"$(jstr "$SYM_IDS[$i]")\",\"title\":\"$(jstr "$SYM_TITLES[$i]")\",\"signal\":\"$(jstr "$SYM_SIGNALS[$i]")\",\"first_step\":\"$(jstr "$SYM_FIRST_STEPS[$i]")\",\"evidence\":\"$(jstr "$SYM_EVIDENCE[$i]")\"}"
+  done
+  print -r -- "],\"limits\":[\"not an Apple patch\",\"workarounds expire when 27.3 ships\",\"no sudo, no deletion, no network\"],\"measurement_only\":false}"
+}
+
+# ---- arg parse ------------------------------------------------------------
+while (( $# )); do
+  case "$1" in
+    --json)    JSON=1 ;;
+    --apply)   MODE="apply" ;;
+    --revert)  MODE="revert" ;;
+    --nudge)   MODE="nudge" ;;
+    --print)   PRINT_ONLY=1 ;;
+    --yes|-y)  ASSUME_YES=1 ;;
+    --version) print -r -- "glasspanic $VERSION"; exit "$EXIT_OK" ;;
+    --help|-h) usage; exit "$EXIT_OK" ;;
+    doctor)    MODE="doctor" ;;
+    *) print -u2 -- "glasspanic: unknown argument '$1' (see --help)"; exit "$EXIT_USAGE" ;;
+  esac
+  shift
+done
+
+collect
+
+case "$MODE" in
+  doctor) (( JSON )) && render_json || render_text; exit "$EXIT_OK" ;;
+  apply)  set_reduce_transparency true 1; exit $? ;;
+  revert) set_reduce_transparency false 0; exit $? ;;
+  nudge)  nudge; exit $? ;;
+esac

@@ -1,0 +1,91 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Ensure zsh
+        shell: bash
+        run: |
+          if ! command -v zsh >/dev/null 2>&1; then
+            command -v apt-get >/dev/null 2>&1 && sudo apt-get update -qq && sudo apt-get install -y zsh
+          fi
+          zsh --version
+
+      - name: Syntax check
+        shell: bash
+        run: zsh -n glasspanic
+
+      - name: Unit and behaviour tests
+        shell: bash
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Real user path (json contract, stubbed host)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, tempfile, stat
+          root = os.getcwd()
+          tmp = tempfile.mkdtemp()
+          binstub = os.path.join(tmp, "bin"); os.makedirs(binstub)
+          stubs = {
+              "defaults": "#!/bin/sh\nexit 1\n",
+              "sw_vers": "#!/bin/sh\ncase \"$1\" in -productVersion) echo 27.2 ;; -buildVersion) echo 26B123 ;; esac\n",
+              "uname": "#!/bin/sh\necho Darwin\n",
+              "pgrep": "#!/bin/sh\nexit 1\n",
+              "killall": "#!/bin/sh\nexit 0\n",
+          }
+          for name, body in stubs.items():
+              p = os.path.join(binstub, name)
+              open(p, "w").write(body)
+              os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
+          env = dict(os.environ, PATH=binstub + ":/usr/bin:/bin")
+          out = subprocess.run(["zsh", os.path.join(root, "glasspanic"), "--json"],
+                               capture_output=True, text=True, env=env, check=True).stdout
+          d = json.loads(out)
+          assert d["read_only"] is True and d["sudo_used"] is False
+          assert len(d["symptoms"]) == 4
+          assert d["system"]["version"] == "27.2"
+          print("json contract OK")
+          PY
+
+      - name: Real user path (live macOS, read-only)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./glasspanic --json > live.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("live.json"))
+          assert d["read_only"] is True, d
+          assert d["sudo_used"] is False, d
+          assert len(d["symptoms"]) == 4, d
+          assert all(p["state"] in {"present", "unset", "unsupported"} for p in d["view_settings"]), d
+          print("live doctor OK:", d["system"])
+          PY
+          ./glasspanic > doctor.txt
+          grep -q "SYMPTOM MAP" doctor.txt
+          ./glasspanic --apply --print | grep -q "would run:"
+
+      - name: Read-only audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -nE '(^|[^a-z])sudo |curl |wget |killall -9|rm -rf' glasspanic; then
+            echo "::error::destructive or network command found in glasspanic"
+            exit 1
+          fi
+          echo "read-only audit OK"
